@@ -1,0 +1,95 @@
+name: deploy-vps-server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          PROD_HOST="${{ secrets.PRODUCTION_VPS_HOST }}"
+          PROD_USER="${{ secrets.PRODUCTION_VPS_USERNAME }}"
+          PROD_PORT="${{ secrets.PRODUCTION_VPS_PORT }}"
+          PROD_KEY="${{ secrets.PRODUCTION_VPS_SSH }}"
+          DEPLOY_PATH="${{ secrets.PRODUCTION_VPS_REMOTE_PATH }}"
+
+          if [ -z "$PROD_HOST" ] || [ -z "$PROD_USER" ] || [ -z "$PROD_KEY" ] || [ -z "$DEPLOY_PATH" ]; then
+            echo "Missing required deployment secrets."
+            exit 1
+          fi
+
+          PROD_PORT="${PROD_PORT:-22}"
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$PROD_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$PROD_PORT" -H "$PROD_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync application to VPS
+        env:
+          PROD_HOST: ${{ secrets.PRODUCTION_VPS_HOST }}
+          PROD_USER: ${{ secrets.PRODUCTION_VPS_USERNAME }}
+          PROD_PORT: ${{ secrets.PRODUCTION_VPS_PORT }}
+          DEPLOY_PATH: ${{ secrets.PRODUCTION_VPS_REMOTE_PATH }}
+        run: |
+          PROD_PORT="${PROD_PORT:-22}"
+
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key -p ${PROD_PORT} -o StrictHostKeyChecking=yes" \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'node_modules' \
+            --exclude '.env' \
+            --exclude '.DS_Store' \
+            ./ "${PROD_USER}@${PROD_HOST}:${DEPLOY_PATH}/"
+
+      - name: Deploy with Docker Compose on VPS
+        env:
+          PROD_HOST: ${{ secrets.PRODUCTION_VPS_HOST }}
+          PROD_USER: ${{ secrets.PRODUCTION_VPS_USERNAME }}
+          PROD_PORT: ${{ secrets.PRODUCTION_VPS_PORT }}
+          DEPLOY_PATH: ${{ secrets.PRODUCTION_VPS_REMOTE_PATH }}
+        run: |
+          PROD_PORT="${PROD_PORT:-22}"
+
+          ssh -i ~/.ssh/deploy_key -p "${PROD_PORT}" "${PROD_USER}@${PROD_HOST}" \
+            "set -euo pipefail && \
+             cd '${DEPLOY_PATH}' && \
+             docker compose -f docker-compose.prod.yml up -d --build --remove-orphans && \
+             docker compose -f docker-compose.prod.yml ps"
+
+      - name: Verify deployment
+        env:
+          PROD_HOST: ${{ secrets.PRODUCTION_VPS_HOST }}
+          PROD_USER: ${{ secrets.PRODUCTION_VPS_USERNAME }}
+          PROD_PORT: ${{ secrets.PRODUCTION_VPS_PORT }}
+          DEPLOY_PATH: ${{ secrets.PRODUCTION_VPS_REMOTE_PATH }}
+        run: |
+          PROD_PORT="${PROD_PORT:-22}"
+
+          ssh -i ~/.ssh/deploy_key -p "${PROD_PORT}" "${PROD_USER}@${PROD_HOST}" \
+            "set -euo pipefail && \
+             cd '${DEPLOY_PATH}' && \
+             for i in 1 2 3 4 5 6 7 8 9 10; do \
+               if curl -fsS http://localhost:5678/api/v1/health >/dev/null 2>&1; then \
+                 curl -fsS http://localhost:5678/api/v1/health; \
+                 exit 0; \
+               fi; \
+               sleep 3; \
+             done; \
+             echo 'Health check failed'; \
+             docker compose -f docker-compose.prod.yml logs --tail=100 app; \
+             exit 1"
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

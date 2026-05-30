@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Real-time User Tracker</title>
+    <script src="/socket.io/socket.io.min.js"></script>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 1.5rem;
+        line-height: 1.5;
+      }
+      h1 {
+        margin-top: 0;
+      }
+      section {
+        margin-bottom: 1.5rem;
+        padding: 1rem;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+      }
+      label {
+        display: block;
+        margin-bottom: 0.25rem;
+        font-weight: 600;
+      }
+      select,
+      input,
+      button {
+        font: inherit;
+        padding: 0.5rem 0.75rem;
+        margin-right: 0.5rem;
+        margin-bottom: 0.5rem;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      #connectionStatus {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 999px;
+        font-size: 0.875rem;
+        font-weight: 600;
+      }
+      #connectionStatus.idle {
+        background: #f3f4f6;
+        color: #374151;
+      }
+      #connectionStatus.connected {
+        background: #dcfce7;
+        color: #166534;
+      }
+      #connectionStatus.disconnected {
+        background: #fee2e2;
+        color: #991b1b;
+      }
+      #onlineUsers div,
+      #activities div {
+        padding: 0.35rem 0;
+        border-bottom: 1px solid #eee;
+      }
+      #activities {
+        height: 300px;
+        overflow-y: auto;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        padding: 0.75rem;
+        background: #fafafa;
+      }
+      .hint {
+        color: #666;
+        font-size: 0.875rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Real-time User Tracker</h1>
+    <p>
+      Status:
+      <span id="connectionStatus" class="idle">Idle — select a user and connect</span>
+    </p>
+
+    <section>
+      <h2>Go Online</h2>
+      <p class="hint">
+        Open this page at <strong>http://localhost:5678</strong> (not as a local
+        file). Pick a user, then click <strong>Go Online</strong>.
+      </p>
+      <label for="userSelect">User</label>
+      <select id="userSelect">
+        <option value="">Loading users...</option>
+      </select>
+      <button id="connectBtn" onclick="connectUser()" disabled>
+        Go Online
+      </button>
+      <button id="disconnectBtn" onclick="disconnectUser()" disabled>
+        Go Offline
+      </button>
+      <button onclick="loadUsers()">Refresh Users</button>
+    </section>
+
+    <section>
+      <h2>
+        Online Users: <span id="onlineCount">0</span>
+      </h2>
+      <div id="onlineUsers"></div>
+    </section>
+
+    <section>
+      <h2>Real-time Activities</h2>
+      <div id="activities"></div>
+    </section>
+
+    <section>
+      <h2>Typing Indicator</h2>
+      <input type="text" id="message" placeholder="Type something..." />
+      <button id="typingBtn" onclick="sendTyping()" disabled>
+        Send typing indicator
+      </button>
+    </section>
+
+    <script>
+      let socket = null;
+      let currentUser = null;
+
+      const userSelect = document.getElementById("userSelect");
+      const connectBtn = document.getElementById("connectBtn");
+      const disconnectBtn = document.getElementById("disconnectBtn");
+      const typingBtn = document.getElementById("typingBtn");
+      const connectionStatus = document.getElementById("connectionStatus");
+
+      function setConnectionStatus(state, message) {
+        connectionStatus.textContent = message;
+        connectionStatus.className = state;
+        connectBtn.disabled = state === "connected" || !userSelect.value;
+        disconnectBtn.disabled = state !== "connected";
+        typingBtn.disabled = state !== "connected";
+        userSelect.disabled = state === "connected";
+      }
+
+      function cleanupSocket() {
+        if (!socket) return;
+        socket.removeAllListeners();
+        socket.disconnect();
+        socket = null;
+      }
+
+      async function loadUsers() {
+        try {
+          const res = await fetch("/api/v1/users");
+          if (!res.ok) throw new Error("Failed to load users");
+          const users = await res.json();
+
+          userSelect.innerHTML =
+            users.length === 0
+              ? '<option value="">No users yet — create one via API</option>'
+              : '<option value="">Select a user...</option>' +
+                users
+                  .map(
+                    (user) =>
+                      `<option value="${user.id}" data-name="${user.name}">${user.name} (${user.email})${user.isOnline ? " — online" : ""}</option>`,
+                  )
+                  .join("");
+
+          connectBtn.disabled = !userSelect.value;
+        } catch (error) {
+          userSelect.innerHTML =
+            '<option value="">Failed to load users</option>';
+          addActivity(`Error loading users: ${error.message}`);
+        }
+      }
+
+      userSelect.addEventListener("change", () => {
+        connectBtn.disabled = !!socket?.connected || !userSelect.value;
+      });
+
+      function connectUser() {
+        const userId = userSelect.value;
+        const selectedOption = userSelect.selectedOptions[0];
+        const userName = selectedOption?.dataset.name;
+
+        if (!userId || !userName) return;
+
+        cleanupSocket();
+        currentUser = { userId, userName };
+        setConnectionStatus("idle", "Connecting...");
+
+        const newSocket = io({
+          path: "/socket.io",
+          transports: ["polling", "websocket"],
+          reconnection: true,
+          reconnectionAttempts: 5,
+          auth: {
+            userId,
+            userName,
+          },
+        });
+
+        socket = newSocket;
+
+        newSocket.on("connect", () => {
+          if (socket !== newSocket) return;
+          setConnectionStatus("connected", `Connected as ${userName}`);
+          addActivity(`Connected as ${userName}`);
+        });
+
+        newSocket.on("disconnect", (reason) => {
+          if (socket !== newSocket) return;
+          setConnectionStatus("disconnected", `Disconnected (${reason})`);
+          addActivity(`Disconnected: ${reason}`);
+        });
+
+        newSocket.on("connect_error", (error) => {
+          if (socket !== newSocket) return;
+          setConnectionStatus("disconnected", `Connection failed`);
+          addActivity(`Connection error: ${error.message}`);
+        });
+
+        newSocket.on("online-users:list", (users) => {
+          if (socket !== newSocket) return;
+          updateOnlineUsers(users);
+        });
+
+        newSocket.on("online-users:count", (data) => {
+          if (socket !== newSocket) return;
+          document.getElementById("onlineCount").innerText = data.count;
+        });
+
+        newSocket.on("user:online", (user) => {
+          if (socket !== newSocket) return;
+          addActivity(`${user.userName} came online`);
+          updateOnlineUsersFromServer();
+        });
+
+        newSocket.on("user:offline", (user) => {
+          if (socket !== newSocket) return;
+          addActivity(`${user.userName} went offline`);
+          updateOnlineUsersFromServer();
+        });
+
+        newSocket.on("user:typing", (data) => {
+          if (socket !== newSocket) return;
+          if (data.userId === currentUser?.userId) return;
+          addActivity(
+            `${data.userName} is ${data.isTyping ? "typing" : "idle"}`,
+          );
+        });
+
+        newSocket.on("user:created", (user) => {
+          if (socket !== newSocket) return;
+          addActivity(`New user registered: ${user.name}`);
+          loadUsers();
+        });
+
+        newSocket.on("user:updated", (user) => {
+          if (socket !== newSocket) return;
+          addActivity(`User updated: ${user.name}`);
+          loadUsers();
+        });
+
+        newSocket.on("user:deleted", (payload) => {
+          if (socket !== newSocket) return;
+          addActivity(`User deleted: ${payload.id}`);
+          if (currentUser?.userId === payload.id) {
+            disconnectUser();
+          }
+          loadUsers();
+        });
+
+        newSocket.on("todo:created", (todo) => {
+          if (socket !== newSocket) return;
+          addActivity(`Todo created: ${todo.title}`);
+        });
+
+        newSocket.on("todo:updated", (todo) => {
+          if (socket !== newSocket) return;
+          addActivity(
+            `Todo updated: ${todo.title} (${todo.completed ? "done" : "open"})`,
+          );
+        });
+
+        newSocket.on("todo:deleted", (payload) => {
+          if (socket !== newSocket) return;
+          addActivity(`Todo deleted: ${payload.id}`);
+        });
+
+        newSocket.on("room:user-joined", (data) => {
+          if (socket !== newSocket) return;
+          addActivity(`User ${data.userId} joined room ${data.room}`);
+        });
+
+        newSocket.on("room:user-left", (data) => {
+          if (socket !== newSocket) return;
+          addActivity(`User ${data.userId} left room ${data.room}`);
+        });
+      }
+
+      async function updateOnlineUsersFromServer() {
+        try {
+          const res = await fetch("/api/v1/online-users");
+          if (!res.ok) return;
+          const data = await res.json();
+          updateOnlineUsers(data.users);
+        } catch {
+          // ignore polling errors
+        }
+      }
+
+      function disconnectUser() {
+        cleanupSocket();
+        currentUser = null;
+        setConnectionStatus("idle", "Idle — select a user and connect");
+        addActivity("You went offline");
+      }
+
+      function updateOnlineUsers(users) {
+        document.getElementById("onlineCount").innerText = users.length;
+        const container = document.getElementById("onlineUsers");
+        container.innerHTML =
+          users.length === 0
+            ? "<div>No users online</div>"
+            : users
+                .map(
+                  (user) =>
+                    `<div>🟢 ${user.userName} (${user.userId}) — since ${new Date(user.connectedAt).toLocaleTimeString()}</div>`,
+                )
+                .join("");
+      }
+
+      function sendTyping() {
+        const message = document.getElementById("message").value;
+        if (socket?.connected && currentUser) {
+          socket.emit("user:typing", {
+            userId: currentUser.userId,
+            userName: currentUser.userName,
+            isTyping: !!message,
+          });
+          addActivity(`You sent typing indicator${message ? `: "${message}"` : ""}`);
+        }
+      }
+
+      function addActivity(message) {
+        const activities = document.getElementById("activities");
+        const div = document.createElement("div");
+        div.textContent = `${new Date().toLocaleTimeString()}: ${message}`;
+        activities.appendChild(div);
+        activities.scrollTop = activities.scrollHeight;
+      }
+
+      loadUsers();
+      setConnectionStatus("idle", "Idle — select a user and connect");
+    </script>
+  </body>
+</html>
