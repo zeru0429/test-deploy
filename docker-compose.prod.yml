@@ -6,9 +6,9 @@ services:
     restart: unless-stopped
     ports:
       - "5678:5678"
-    env_file:
-      - .env
     environment:
+      PORT: 5678
+      NODE_ENV: production
       DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/mydb
       REDIS_URL: redis://redis:6379
       HOST: 0.0.0.0
